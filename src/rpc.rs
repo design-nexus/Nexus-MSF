@@ -456,7 +456,7 @@ impl Worker {
         let text = if let Some(m) = as_map(&v) {
             map_str(&m, "data").unwrap_or_default()
         } else {
-            v.as_str().unwrap_or("").to_string()
+            value_string(&v).unwrap_or_default()
         };
         self.emit(Event::SessionIo {
             id: id.into(),
@@ -726,27 +726,38 @@ fn parse_sid(id: &str) -> Value {
 
 pub type Map = Vec<(String, Value)>;
 
+/// Framework encodes RPC strings as MessagePack **bin**, not UTF-8 str.
+pub fn value_string(v: &Value) -> Option<String> {
+    if let Some(s) = v.as_str() {
+        return Some(s.to_string());
+    }
+    if let Some(b) = v.as_slice() {
+        if let Ok(s) = std::str::from_utf8(b) {
+            return Some(s.to_string());
+        }
+    }
+    if let Some(n) = v.as_i64() {
+        return Some(n.to_string());
+    }
+    if let Some(n) = v.as_f64() {
+        return Some(n.to_string());
+    }
+    None
+}
+
 pub fn as_map(v: &Value) -> Option<Map> {
     let m = v.as_map()?;
     Some(
         m.iter()
-            .filter_map(|(k, val)| k.as_str().map(|s| (s.to_string(), val.clone())))
+            .filter_map(|(k, val)| value_string(k).map(|s| (s, val.clone())))
             .collect(),
     )
 }
 
 pub fn map_str(map: &Map, k: &str) -> Option<String> {
-    map.iter().find(|(key, _)| key == k).and_then(|(_, v)| {
-        v.as_str()
-            .map(|s| s.to_string())
-            .or_else(|| v.as_i64().map(|n| n.to_string()))
-            .or_else(|| v.as_f64().map(|n| n.to_string()))
-            .or_else(|| {
-                v.as_slice()
-                    .and_then(|b| std::str::from_utf8(b).ok())
-                    .map(|s| s.to_string())
-            })
-    })
+    map.iter()
+        .find(|(key, _)| key == k)
+        .and_then(|(_, v)| value_string(v))
 }
 
 fn map_bool(map: &Map, k: &str) -> bool {
@@ -1008,4 +1019,44 @@ fn parse_options(v: &Value) -> Vec<ModuleOption> {
     }
     out.sort_by(|a, b| b.required.cmp(&a.required).then(a.name.cmp(&b.name)));
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn login_response_bin_keys() {
+        // msfrpcd encodes map keys/values as msgpack bin, not str.
+        let v = Value::Map(vec![
+            (
+                Value::Binary(b"result".to_vec()),
+                Value::Binary(b"success".to_vec()),
+            ),
+            (
+                Value::Binary(b"token".to_vec()),
+                Value::Binary(b"TEMPUl2yTx1AMmX43T9WLeN8thjG1dul".to_vec()),
+            ),
+        ]);
+        let map = as_map(&v).expect("map");
+        assert_eq!(map_str(&map, "result").as_deref(), Some("success"));
+        assert_eq!(
+            map_str(&map, "token").as_deref(),
+            Some("TEMPUl2yTx1AMmX43T9WLeN8thjG1dul")
+        );
+        assert!(rpc_error(&v).is_none());
+    }
+
+    #[test]
+    fn login_response_from_wire() {
+        let bytes: &[u8] = b"\x82\xc4\x06result\xc4\x07success\xc4\x05token\xc4 TEMPUl2yTx1AMmX43T9WLeN8thjG1dul";
+        // 0x20 after last c4 is length 32; the space in the rust string is that byte.
+        let v = decode_value(bytes).expect("decode");
+        let map = as_map(&v).expect("map");
+        assert_eq!(map_str(&map, "result").as_deref(), Some("success"));
+        assert_eq!(
+            map_str(&map, "token").unwrap().len(),
+            32
+        );
+    }
 }
