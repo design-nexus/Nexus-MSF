@@ -324,9 +324,16 @@ impl App {
         let (tx, rx) = rpc::start_worker(self.config.clone());
         self.cmd_tx = Some(tx);
         self.ev_rx = Some(rx);
+        self.busy = true;
+        self.status = "connecting…".into();
+        self.send(Cmd::Connect);
     }
 
-    fn send(&self, cmd: Cmd) {
+    fn send(&mut self, cmd: Cmd) {
+        if !self.demo && !self.connected && !matches!(cmd, Cmd::Connect | Cmd::Disconnect) {
+            self.status = "not connected — Ctrl-G on Dash to connect".into();
+            return;
+        }
         if let Some(tx) = &self.cmd_tx {
             let _ = tx.send(cmd);
         }
@@ -350,10 +357,18 @@ impl App {
             Event::Error(s) => {
                 self.busy = false;
                 self.status = s.clone();
-                self.modal = Modal::Message {
-                    title: "RPC error".into(),
-                    body: s,
-                };
+                if s.contains("not connected") {
+                    self.modal = Modal::Confirm {
+                        title: "Not connected to msfrpcd".into(),
+                        body: format!("{s}\n\nConnect now?"),
+                        action: Action::Connect,
+                    };
+                } else {
+                    self.modal = Modal::Message {
+                        title: "RPC error".into(),
+                        body: s,
+                    };
+                }
             }
             Event::Connected(snap) => {
                 self.connected = true;
@@ -473,6 +488,9 @@ impl App {
         if self.demo {
             self.module_info = Some(demo::module_info(self.module_kind.as_str(), &name));
             self.option_idx = 0;
+            return;
+        }
+        if !self.connected {
             return;
         }
         self.send(Cmd::FetchModule {
@@ -755,6 +773,20 @@ impl App {
     }
 
     fn prompt_primary(&mut self) {
+        if !self.demo && !self.connected && self.tab != Tab::Dash {
+            self.confirm(
+                Action::Connect,
+                "Not connected to msfrpcd",
+                &format!(
+                    "{}://{}:{}  user={}\nConnect first, then retry.",
+                    if self.config.ssl { "https" } else { "http" },
+                    self.config.host,
+                    self.config.port,
+                    self.config.username
+                ),
+            );
+            return;
+        }
         match self.tab {
             Tab::Dash => self.confirm(
                 Action::Connect,
@@ -1186,7 +1218,8 @@ impl App {
             ("ftp", 21, "scanner/ftp/ftp_login"),
             ("mysql", 3306, "scanner/mysql/mysql_login"),
         ];
-        for cred in self.snap.creds.clone() {
+        let mut jobs = Vec::new();
+        for cred in &self.snap.creds {
             for host in &self.snap.hosts {
                 for svc in &host.services {
                     if let Some((_, _, module)) = scanners
@@ -1198,14 +1231,17 @@ impl App {
                         opts.insert("RPORT".into(), svc.port.to_string());
                         opts.insert("USERNAME".into(), cred.user.clone());
                         opts.insert("PASSWORD".into(), cred.pass.clone());
-                        self.send(Cmd::ExecuteModule {
-                            kind: "auxiliary".into(),
-                            name: (*module).into(),
-                            opts,
-                        });
+                        jobs.push((*module, opts));
                     }
                 }
             }
+        }
+        for (module, opts) in jobs {
+            self.send(Cmd::ExecuteModule {
+                kind: "auxiliary".into(),
+                name: module.into(),
+                opts,
+            });
         }
     }
 

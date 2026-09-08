@@ -3,6 +3,7 @@ use crate::persist::Config;
 use anyhow::{Context, Result, bail};
 use rmpv::Value;
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::process::Child;
 use tokio::sync::mpsc;
@@ -47,7 +48,9 @@ impl Client {
         let url = format!("{scheme}://{}:{}{}", cfg.host, cfg.port, cfg.uri);
         let http = reqwest::Client::builder()
             .danger_accept_invalid_certs(true)
+            .connect_timeout(Duration::from_secs(2))
             .timeout(Duration::from_secs(60))
+            .no_proxy()
             .build()?;
         Ok(Self {
             url,
@@ -255,7 +258,9 @@ impl Worker {
     }
 
     fn cli(&mut self) -> Result<&mut Client> {
-        self.client.as_mut().context("not connected")
+        self.client
+            .as_mut()
+            .context("not connected to msfrpcd — press Ctrl-G on Dash to connect")
     }
 
     async fn connect(&mut self) -> Result<()> {
@@ -269,9 +274,9 @@ impl Worker {
                     "rpc not up ({e}); spawning msfrpcd on 127.0.0.1"
                 )));
                 self.spawn_msfrpcd().await?;
-                tokio::time::sleep(Duration::from_secs(2)).await;
+                tokio::time::sleep(Duration::from_millis(800)).await;
                 let mut last = None;
-                for _ in 0..20 {
+                for _ in 0..25 {
                     match self.try_login().await {
                         Ok(()) => {
                             last = None;
@@ -284,7 +289,9 @@ impl Worker {
                     }
                 }
                 if let Some(e) = last {
-                    return Err(e);
+                    return Err(e).context(
+                        "could not log in to msfrpcd (check password, SSL, and that the daemon is up)",
+                    );
                 }
             } else {
                 return Err(e);
@@ -301,10 +308,28 @@ impl Worker {
         if pass.is_empty() {
             bail!("no RPC password (set NEXUS_MSF_RPC_PASS or config.password)");
         }
-        let mut c = Client::new(&self.cfg)?;
-        c.login(&self.cfg.username, &pass).await?;
-        self.client = Some(c);
-        Ok(())
+        let users = unique_users(&self.cfg.username);
+        let ssls = [self.cfg.ssl, !self.cfg.ssl];
+        let mut last = None;
+        for ssl in ssls {
+            for user in &users {
+                let mut cfg = self.cfg.clone();
+                cfg.ssl = ssl;
+                match Client::new(&cfg) {
+                    Ok(mut c) => match c.login(user, &pass).await {
+                        Ok(()) => {
+                            self.cfg.ssl = ssl;
+                            self.cfg.username = user.clone();
+                            self.client = Some(c);
+                            return Ok(());
+                        }
+                        Err(e) => last = Some(e),
+                    },
+                    Err(e) => last = Some(e),
+                }
+            }
+        }
+        Err(last.unwrap_or_else(|| anyhow::anyhow!("login failed")))
     }
 
     async fn spawn_msfrpcd(&mut self) -> Result<()> {
@@ -312,8 +337,11 @@ impl Worker {
         if pass.is_empty() {
             bail!("cannot spawn msfrpcd without a password");
         }
+        let bin = find_msfrpcd().context(
+            "msfrpcd not found on PATH — install Metasploit Framework, or start it yourself:\n  msfrpcd -U msf -P \"$NEXUS_MSF_RPC_PASS\" -a 127.0.0.1 -p 55553 -S -f",
+        )?;
         let port = self.cfg.port.to_string();
-        let mut cmd = tokio::process::Command::new("msfrpcd");
+        let mut cmd = tokio::process::Command::new(&bin);
         cmd.args([
             "-U",
             &self.cfg.username,
@@ -329,8 +357,21 @@ impl Worker {
         .kill_on_drop(true)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-        let child = cmd.spawn().context("spawn msfrpcd (is Metasploit installed?)")?;
+        .stderr(std::process::Stdio::piped());
+        let mut child = cmd
+            .spawn()
+            .with_context(|| format!("spawn {} (is Metasploit installed?)", bin.display()))?;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        if let Some(status) = child.try_wait()? {
+            let mut err = String::new();
+            if let Some(mut s) = child.stderr.take() {
+                let _ = tokio::io::AsyncReadExt::read_to_string(&mut s, &mut err).await;
+            }
+            bail!(
+                "msfrpcd exited {status}: {}",
+                err.trim().chars().take(400).collect::<String>()
+            );
+        }
         self.child = Some(child);
         Ok(())
     }
@@ -631,6 +672,46 @@ impl Worker {
     }
 }
 
+fn unique_users(primary: &str) -> Vec<String> {
+    let mut v = Vec::new();
+    if !primary.is_empty() {
+        v.push(primary.to_string());
+    }
+    if primary != "msf" {
+        v.push("msf".into());
+    }
+    v
+}
+
+fn find_msfrpcd() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("MSFRPCD") {
+        let p = PathBuf::from(p);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    let names = ["msfrpcd", "msfrpcd.ruby"];
+    if let Some(path) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path) {
+            for name in names {
+                let p = dir.join(name);
+                if p.is_file() {
+                    return Some(p);
+                }
+            }
+        }
+    }
+    const CANDIDATES: &[&str] = &[
+        "/usr/bin/msfrpcd",
+        "/usr/local/bin/msfrpcd",
+        "/usr/share/metasploit-framework/msfrpcd",
+        "/opt/metasploit-framework/bin/msfrpcd",
+        "/opt/metasploit-framework/msfrpcd",
+        "/snap/bin/msfrpcd",
+    ];
+    CANDIDATES.iter().map(Path::new).find(|p| p.is_file()).map(Path::to_path_buf)
+}
+
 fn empty_ws(ws: &str) -> Value {
     Value::Map(vec![(Value::from("workspace"), Value::from(ws))])
 }
@@ -660,6 +741,11 @@ pub fn map_str(map: &Map, k: &str) -> Option<String> {
             .map(|s| s.to_string())
             .or_else(|| v.as_i64().map(|n| n.to_string()))
             .or_else(|| v.as_f64().map(|n| n.to_string()))
+            .or_else(|| {
+                v.as_slice()
+                    .and_then(|b| std::str::from_utf8(b).ok())
+                    .map(|s| s.to_string())
+            })
     })
 }
 
