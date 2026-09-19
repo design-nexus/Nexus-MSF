@@ -11,7 +11,7 @@ Only use against systems you own or have written permission to test.
 ## Install
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/kensmith77/Nexus-MSF/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/design-nexus/Nexus-MSF/main/install.sh | sh
 ```
 
 From a clone (needs `cc`, e.g. `sudo apt-get install build-essential pkg-config`):
